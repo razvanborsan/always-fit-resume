@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Dark scrollbar for editor */
+.pagefit-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #404040 transparent;
+}
+.pagefit-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+.pagefit-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.pagefit-scrollbar::-webkit-scrollbar-thumb {
+  background: #404040;
+  border-radius: 3px;
+}
+.pagefit-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #525252;
+}
