@@ -353,74 +353,365 @@ TypeScript · React · Swift · Framer · Origami · Prototyping in code · Anim
 
 const DEFAULT_MD = RESUMES[0];
 
+/* ── Escape helpers ────────────────────────────────────────── */
+const ESCAPE_CHARS = "\\`*_{}[]<>()#+-.!|";
+const ESCAPE_MAP = new Map();
+const UNESCAPE_MAP = new Map();
+for (let i = 0; i < ESCAPE_CHARS.length; i++) {
+  const placeholder = String.fromCharCode(0xe000 + i);
+  ESCAPE_MAP.set("\\" + ESCAPE_CHARS[i], placeholder);
+  UNESCAPE_MAP.set(placeholder, ESCAPE_CHARS[i]);
+}
+
+function escapePreProcess(text) {
+  let out = text;
+  for (const [seq, ph] of ESCAPE_MAP) out = out.replaceAll(seq, ph);
+  return out;
+}
+
+function escapePostProcess(text) {
+  let out = text;
+  for (const [ph, ch] of UNESCAPE_MAP) out = out.replaceAll(ph, ch);
+  return out;
+}
+
+/* ── Inline formatting ────────────────────────────────────── */
+function parseInlineFormatting(rawText) {
+  let text = escapePreProcess(rawText);
+  let plain = "";
+  const ranges = [];
+
+  // Pass 1: inline code (highest priority — contents are literal)
+  const codeParts = [];
+  let codeIdx = 0;
+  text = text.replace(/``(.+?)``|`([^`]+)`/g, (m, g1, g2, offset) => {
+    const ph = `\uF000${codeIdx}\uF001`;
+    codeParts.push({ ph, text: g1 ?? g2 });
+    codeIdx++;
+    return ph;
+  });
+
+  // Pass 2: images — render alt text only (no image in resume PDF)
+  text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (m, alt) => alt);
+
+  // Pass 3: links [text](url) and [text](url "title")
+  const linkParts = [];
+  let linkIdx = 0;
+  text = text.replace(/\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (m, txt, url, title) => {
+    const ph = `\uF100${linkIdx}\uF101`;
+    linkParts.push({ ph, text: txt, url, title });
+    linkIdx++;
+    return ph;
+  });
+
+  // Pass 4: auto-links <url> and <email>
+  text = text.replace(/<(https?:\/\/[^>]+)>/g, (m, url) => {
+    const ph = `\uF100${linkIdx}\uF101`;
+    linkParts.push({ ph, text: url, url });
+    linkIdx++;
+    return ph;
+  });
+  text = text.replace(/<([^@>\s]+@[^@>\s]+\.[^>\s]+)>/g, (m, email) => {
+    const ph = `\uF100${linkIdx}\uF101`;
+    linkParts.push({ ph, text: email, url: `mailto:${email}` });
+    linkIdx++;
+    return ph;
+  });
+
+  // Pass 5: HTML inline tags
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+  text = text.replace(/<strong>(.*?)<\/strong>/gi, "**$1**");
+  text = text.replace(/<em>(.*?)<\/em>/gi, "*$1*");
+  text = text.replace(/<a\s+href="([^"]*)"[^>]*>(.*?)<\/a>/gi, (m, url, txt) => {
+    const ph = `\uF100${linkIdx}\uF101`;
+    linkParts.push({ ph, text: txt, url });
+    linkIdx++;
+    return ph;
+  });
+
+  // Pass 6: bold/italic (asterisk and underscore variants)
+  const emphRegex = /\*\*\*(.+?)\*\*\*|___(.+?)___|__\*(.+?)\*__|\*\*_(.+?)_\*\*|\*\*(.+?)\*\*|__(.+?)__|\*(.+?)\*|(?<=\s|^)_(.+?)_(?=\s|$|[.,;:!?)])/g;
+
+  let lastIndex = 0;
+  let match;
+  while ((match = emphRegex.exec(text)) !== null) {
+    const before = text.slice(lastIndex, match.index);
+    appendPlain(before);
+    const start = plain.length;
+
+    const content = match[1] ?? match[2] ?? match[3] ?? match[4];
+    if (content !== undefined) {
+      appendPlain(content);
+      ranges.push({ start, end: plain.length, bold: true, italic: true });
+    } else if (match[5] !== undefined || match[6] !== undefined) {
+      appendPlain(match[5] ?? match[6]);
+      ranges.push({ start, end: plain.length, bold: true, italic: false });
+    } else {
+      appendPlain(match[7] ?? match[8]);
+      ranges.push({ start, end: plain.length, bold: false, italic: true });
+    }
+    lastIndex = match.index + match[0].length;
+  }
+  appendPlain(text.slice(lastIndex));
+
+  plain = escapePostProcess(plain);
+
+  // Restore code/link ranges with correct offsets in the final plain text
+  for (const cp of codeParts) {
+    const idx = plain.indexOf(cp.ph);
+    if (idx === -1) continue;
+    plain = plain.replace(cp.ph, cp.text);
+    ranges.push({ start: idx, end: idx + cp.text.length, code: true });
+  }
+  for (const lp of linkParts) {
+    const idx = plain.indexOf(lp.ph);
+    if (idx === -1) continue;
+    plain = plain.replace(lp.ph, lp.text);
+    ranges.push({ start: idx, end: idx + lp.text.length, link: true, url: lp.url });
+  }
+
+  ranges.sort((a, b) => a.start - b.start);
+  return { plain, ranges };
+
+  function appendPlain(s) { plain += s; }
+}
+
+function buildLineParts(lineText, lineStart, ranges) {
+  const lineEnd = lineStart + lineText.length;
+  const parts = [];
+  let cursor = 0;
+
+  for (const range of ranges) {
+    if (range.end <= lineStart || range.start >= lineEnd) continue;
+
+    const start = Math.max(range.start, lineStart) - lineStart;
+    const end = Math.min(range.end, lineEnd) - lineStart;
+
+    if (start > cursor) {
+      parts.push({ text: lineText.slice(cursor, start) });
+    }
+    parts.push({
+      text: lineText.slice(start, end),
+      bold: range.bold,
+      italic: range.italic,
+      code: range.code,
+      link: range.link,
+      url: range.url,
+    });
+    cursor = end;
+  }
+
+  if (cursor < lineText.length) {
+    parts.push({ text: lineText.slice(cursor) });
+  }
+
+  return parts.some((p) => p.bold || p.italic || p.code || p.link) ? parts : undefined;
+}
+
 /* ── Parse markdown into blocks ────────────────────────────── */
+const HR_RE = /^([*][\s*]*[*][\s*]*[*][\s*]*|[-][\s-]*[-][\s-]*[-][\s-]*|[_][\s_]*[_][\s_]*[_][\s_]*)$/;
+const SETEXT_H1_RE = /^=+\s*$/;
+const SETEXT_H2_RE = /^-+\s*$/;
+const OL_RE = /^(\d+)\.\s+(.*)/;
+const REF_LINK_RE = /^\[([^\]]+)\]:\s+<?([^\s>]+)>?(?:\s+["'(]([^"')]+)["')])?$/;
+
 function parseMarkdown(md) {
   const blocks = [];
   const lines = md.split("\n");
+
+  // Collect reference-style link definitions (two-pass)
+  const refLinks = new Map();
+  for (const line of lines) {
+    const m = line.match(REF_LINK_RE);
+    if (m) refLinks.set(m[1].toLowerCase(), { url: m[2], title: m[3] });
+  }
+
+  let paraLines = [];
   let i = 0;
+
+  function flushParagraph() {
+    if (paraLines.length === 0) return;
+    const text = paraLines
+      .map((l) => (l.endsWith("  ") ? l.replace(/ {2,}$/, "\n") : l))
+      .join(" ")
+      .replace(/ \n/g, "\n");
+    const prevBlock = blocks[blocks.length - 1];
+    const isAfterTitle = prevBlock && prevBlock.bold && prevBlock.fontScale === 1 && prevBlock.mb === 2;
+    if (isAfterTitle) {
+      blocks.push({ text, fontScale: 0.8, bold: false, mb: 6, color: "#999" });
+    } else if (prevBlock && prevBlock.fontScale === 1.5) {
+      blocks.push({ text, fontScale: 1, bold: false, mb: 6, color: "#555" });
+    } else if (prevBlock && !prevBlock.bold && prevBlock.color === "#555" && prevBlock.mb === 6 && prevBlock.fontScale === 1) {
+      blocks.push({ text, fontScale: 0.8, bold: false, mb: 16, color: "#999" });
+    } else {
+      blocks.push({ text, fontScale: 1, bold: false, mb: 6, color: "#333" });
+    }
+    paraLines = [];
+  }
 
   while (i < lines.length) {
     const line = lines[i];
+    const trimmed = line.trim();
+    const escapedLine = escapePreProcess(line);
 
-    if (line.trim() === "---") {
+    // Skip reference link definitions (already collected)
+    if (REF_LINK_RE.test(line)) { i++; continue; }
+
+    // Setext headings: check if NEXT line is === or ---
+    if (trimmed !== "" && i + 1 < lines.length) {
+      const nextLine = lines[i + 1];
+      if (SETEXT_H1_RE.test(nextLine)) {
+        flushParagraph();
+        blocks.push({ text: trimmed, fontScale: 1.5, bold: true, mb: 4, color: "#111" });
+        i += 2;
+        continue;
+      }
+      if (SETEXT_H2_RE.test(nextLine) && !HR_RE.test(trimmed)) {
+        flushParagraph();
+        blocks.push({ text: trimmed, fontScale: 0.85, bold: true, mt: 18, mb: 3, color: "#999" });
+        i += 2;
+        continue;
+      }
+    }
+
+    // Horizontal rule
+    if (HR_RE.test(trimmed)) {
+      flushParagraph();
       blocks.push({ type: "hr", mb: 16 });
       i++;
       continue;
     }
 
-    if (line.trim() === "") {
+    // Empty line — flush paragraph
+    if (trimmed === "") {
+      flushParagraph();
       i++;
       continue;
     }
 
-    if (line.startsWith("# ")) {
-      blocks.push({ text: line.slice(2), fontScale: 1.5, bold: true, mb: 4, color: "#111" });
-      i++;
-      continue;
+    // ATX headings (check longest prefix first)
+    if (escapedLine.startsWith("###### ")) {
+      flushParagraph();
+      blocks.push({ text: line.slice(7), fontScale: 0.85, bold: false, mt: 4, mb: 2, color: "#555" });
+      i++; continue;
     }
-
-    if (line.startsWith("## ")) {
-      blocks.push({ text: line.slice(3), fontScale: 0.85, bold: true, mt: 18, mb: 3, color: "#999" });
-      i++;
-      continue;
+    if (escapedLine.startsWith("##### ")) {
+      flushParagraph();
+      blocks.push({ text: line.slice(6), fontScale: 0.9, bold: true, mt: 6, mb: 2, color: "#555" });
+      i++; continue;
     }
-
-    if (line.startsWith("### ")) {
+    if (escapedLine.startsWith("#### ")) {
+      flushParagraph();
+      blocks.push({ text: line.slice(5), fontScale: 0.95, bold: true, mt: 8, mb: 2, color: "#333" });
+      i++; continue;
+    }
+    if (escapedLine.startsWith("### ")) {
+      flushParagraph();
       const prev = blocks[blocks.length - 1];
       const afterSection = prev && prev.fontScale === 0.85 && prev.bold;
       blocks.push({ text: line.slice(4), fontScale: 1, bold: true, mt: afterSection ? 0 : 10, mb: 2, color: "#111" });
-      i++;
+      i++; continue;
+    }
+    if (escapedLine.startsWith("## ")) {
+      flushParagraph();
+      blocks.push({ text: line.slice(3), fontScale: 0.85, bold: true, mt: 18, mb: 3, color: "#999" });
+      i++; continue;
+    }
+    if (escapedLine.startsWith("# ")) {
+      flushParagraph();
+      blocks.push({ text: line.slice(2), fontScale: 1.5, bold: true, mb: 4, color: "#111" });
+      i++; continue;
+    }
+
+    // Blockquote
+    if (line.startsWith(">")) {
+      flushParagraph();
+      let depth = 0;
+      let content = line;
+      while (content.startsWith(">")) {
+        depth++;
+        content = content.slice(1);
+        if (content.startsWith(" ")) content = content.slice(1);
+      }
+      blocks.push({
+        type: "blockquote",
+        text: content,
+        fontScale: 0.95,
+        bold: false,
+        italic: true,
+        mb: 3,
+        color: "#666",
+        indent: depth * 16,
+      });
+      i++; continue;
+    }
+
+    // Code block (4-space indent or tab)
+    if (line.startsWith("    ") || line.startsWith("\t")) {
+      flushParagraph();
+      const codeLines = [];
+      while (i < lines.length && (lines[i].startsWith("    ") || lines[i].startsWith("\t"))) {
+        codeLines.push(lines[i].startsWith("\t") ? lines[i].slice(1) : lines[i].slice(4));
+        i++;
+      }
+      blocks.push({
+        text: codeLines.join("\n"),
+        fontScale: 0.85,
+        bold: false,
+        mb: 6,
+        color: "#666",
+        monospace: true,
+      });
       continue;
     }
 
-    if (line.startsWith("- ")) {
+    // Unordered list (-, *, +)
+    if (/^[-*+] /.test(line)) {
+      flushParagraph();
       blocks.push({ text: "\u2022 " + line.slice(2), fontScale: 1, bold: false, mb: 3, color: "#555" });
-      i++;
-      continue;
+      i++; continue;
     }
 
-    const prevBlock = blocks[blocks.length - 1];
-    const isAfterTitle = prevBlock && prevBlock.bold && prevBlock.fontScale === 1 && prevBlock.mb === 2;
-
-    if (isAfterTitle) {
-      blocks.push({ text: line, fontScale: 0.8, bold: false, mb: 6, color: "#999" });
-    } else if (prevBlock && prevBlock.fontScale === 1.5) {
-      blocks.push({ text: line, fontScale: 1, bold: false, mb: 6, color: "#555" });
-    } else if (prevBlock && !prevBlock.bold && prevBlock.color === "#555" && prevBlock.mb === 6 && prevBlock.fontScale === 1) {
-      blocks.push({ text: line, fontScale: 0.8, bold: false, mb: 16, color: "#999" });
-    } else {
-      blocks.push({ text: line, fontScale: 1, bold: false, mb: 6, color: "#333" });
+    // Ordered list
+    const olMatch = line.match(OL_RE);
+    if (olMatch) {
+      flushParagraph();
+      blocks.push({ text: olMatch[1] + ". " + olMatch[2], fontScale: 1, bold: false, mb: 3, color: "#555" });
+      i++; continue;
     }
+
+    // Plain text — accumulate for paragraph joining
+    paraLines.push(line);
     i++;
+  }
+
+  flushParagraph();
+
+  // Resolve reference-style links in block text, then parse inline formatting
+  for (const block of blocks) {
+    if (!block.text) continue;
+    // Replace [text][id] and [text][] with inline links before inline parsing
+    if (refLinks.size > 0) {
+      block.text = block.text.replace(/\[([^\]]+)\]\[([^\]]*)\]/g, (m, txt, id) => {
+        const key = (id || txt).toLowerCase();
+        const ref = refLinks.get(key);
+        return ref ? `[${txt}](${ref.url}${ref.title ? ` "${ref.title}"` : ""})` : m;
+      });
+    }
+    const { plain, ranges } = parseInlineFormatting(block.text);
+    block.text = plain;
+    if (ranges.length > 0) block.inlineRanges = ranges;
   }
 
   return blocks;
 }
 
 /* ── Build font string (same for prepare + DOM) ──────────── */
+const MONO_FONT = '"Courier New", monospace';
 function fontString(baseFontSize, block) {
   const fs = baseFontSize * block.fontScale;
-  return `${block.bold ? "bold " : ""}${fs}px ${FONT}`;
+  const family = block.monospace ? MONO_FONT : FONT;
+  return `${block.italic ? "italic " : ""}${block.bold ? "bold " : ""}${fs}px ${family}`;
 }
 
 /* ── Measure blocks (pure math, no DOM) ────────────────────── */
@@ -440,7 +731,8 @@ function measureBlocks(blocks, baseFontSize, contentW, lhMult = LH_DEFAULT, sect
     const fs = baseFontSize * block.fontScale;
     const lh = fs * lhMult;
     const font = fontString(baseFontSize, block);
-    h += layout(prepareWithSegments(block.text, font), contentW, lh).height;
+    const effectiveW = contentW - (block.indent || 0);
+    h += layout(prepareWithSegments(block.text, font), effectiveW, lh).height;
     // Skip mb if the next block has mt or is an hr (spacing is handled by them)
     const next = blocks[idx + 1];
     if (next && (next.mt || next.type === "hr")) continue;
@@ -471,18 +763,32 @@ function layoutBlocks(blocks, baseFontSize, contentW, pad, lhMult = LH_DEFAULT, 
     const fs = baseFontSize * block.fontScale;
     const lh = fs * lhMult;
     const font = fontString(baseFontSize, block);
+    const indent = block.indent || 0;
+    const effectiveW = contentW - indent;
     const prepared = prepareWithSegments(block.text, font);
-    const result = layoutWithLines(prepared, contentW, lh);
+    const result = layoutWithLines(prepared, effectiveW, lh);
 
+    let searchFrom = 0;
     for (const line of result.lines) {
+      let parts;
+      if (block.inlineRanges) {
+        const matchIdx = block.text.indexOf(line.text, searchFrom);
+        const lineStart = matchIdx >= 0 ? matchIdx : searchFrom;
+        parts = buildLineParts(line.text, lineStart, block.inlineRanges);
+        searchFrom = lineStart + line.text.length;
+      }
+
       positioned.push({
         type: "text",
         text: line.text,
-        x: pad,
+        parts,
+        x: pad + indent,
         y,
         font,
         fontSize: fs,
         fontWeight: block.bold ? "bold" : "normal",
+        fontStyle: block.italic ? "italic" : undefined,
+        fontFamily: block.monospace ? MONO_FONT : undefined,
         lineHeight: lh,
         color: block.color,
       });
@@ -769,13 +1075,31 @@ export default function App() {
                     top: item.y,
                     fontSize: item.fontSize,
                     fontWeight: item.fontWeight,
-                    fontFamily: FONT,
+                    fontStyle: item.fontStyle,
+                    fontFamily: item.fontFamily || FONT,
                     lineHeight: `${item.lineHeight}px`,
                     color: item.color,
                     whiteSpace: "pre",
                   }}
                 >
-                  {item.text}
+                  {item.parts
+                    ? item.parts.map((part, j) => (
+                        <span
+                          key={j}
+                          style={{
+                            fontWeight: part.bold ? "bold" : undefined,
+                            fontStyle: part.italic ? "italic" : undefined,
+                            fontFamily: part.code ? MONO_FONT : undefined,
+                            backgroundColor: part.code ? "#f3f4f6" : undefined,
+                            borderRadius: part.code ? 3 : undefined,
+                            color: part.link ? "#2563eb" : undefined,
+                            textDecoration: part.link ? "underline" : undefined,
+                          }}
+                        >
+                          {part.text}
+                        </span>
+                      ))
+                    : item.text}
                 </div>
               );
             })}
